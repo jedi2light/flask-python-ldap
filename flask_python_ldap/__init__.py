@@ -67,8 +67,6 @@ class LDAP(object):
 
     @staticmethod
     def teardown(exception):
-        if exception:
-            pass
         ctx = _app_ctx_stack.top
         if hasattr(ctx, 'flask_ldap'):
             ctx.flask_ldap.unbind_s()
