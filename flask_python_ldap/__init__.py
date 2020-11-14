@@ -167,7 +167,7 @@ class BaseQuery(object):
     
     def all(self):
         return [self.model.from_search(*result) for result in self._search()]
-    
+
     def first(self):
         res = self._search()
         return self.model.from_search(*res[0]) if res else None
