@@ -1,6 +1,6 @@
 import certifi, ldap
-from flask import current_app, _app_ctx_stack
 from ldap.filter import filter_format
+from flask import current_app, _app_ctx_stack
 
 
 def get_mod_list(old_attrs, new_attrs):
@@ -9,19 +9,19 @@ def get_mod_list(old_attrs, new_attrs):
     new_key_set = set(new_attrs.keys())
     for key in old_key_set - new_key_set:
         modifications.append((ldap.MOD_DELETE, key, None))
-    for key, newValue in new_attrs.items():
+    for key, new_value in new_attrs.items():
         old_value = old_attrs.get(key, [])
-        if not newValue:
+        if not new_value:
             modifications.append((ldap.MOD_DELETE, key, None))
         else:
             old_value_set = set(old_value)
-            new_value_set = set(newValue)
+            new_value_set = set(new_value)
             additions = list(new_value_set - old_value_set)
             deletions = list(old_value_set - new_value_set)
             if additions and deletions:
                 # Minimize the number of values that needs to be transferred
-                if len(additions + deletions) >= len(newValue):
-                    modifications.append((ldap.MOD_REPLACE, key, newValue))
+                if len(additions + deletions) >= len(new_value):
+                    modifications.append((ldap.MOD_REPLACE, key, new_value))
                 else:
                     modifications.append((ldap.MOD_DELETE, key, deletions))
                     modifications.append((ldap.MOD_ADD, key, additions))
