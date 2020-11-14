@@ -1,35 +1,34 @@
-import certifi
-import ldap
-from ldap.modlist import addModlist
+import certifi, ldap
 from flask import current_app, _app_ctx_stack
+from ldap.filter import filter_format
 
 
-def modify_modlist(oldAttrs, newAttrs):
+def get_mod_list(old_attrs, new_attrs):
     modifications = []
-    oldKeySet = set(oldAttrs.keys())
-    newKeySet = set(newAttrs.keys())
-    for key in oldKeySet - newKeySet:
+    old_key_set = set(old_attrs.keys())
+    new_key_set = set(new_attrs.keys())
+    for key in old_key_set - new_key_set:
         modifications.append((ldap.MOD_DELETE, key, None))
-    for key, newValue in newAttrs.items():
-        oldValue = oldAttrs.get(key, [])
+    for key, newValue in new_attrs.items():
+        old_value = old_attrs.get(key, [])
         if not newValue:
             modifications.append((ldap.MOD_DELETE, key, None))
         else:
-            oldValueSet = set(oldValue)
-            newValueSet = set(newValue)
-            addList = list(newValueSet - oldValueSet)
-            removeList = list(oldValueSet - newValueSet)
-            if addList and removeList:
+            old_value_set = set(old_value)
+            new_value_set = set(newValue)
+            additions = list(new_value_set - old_value_set)
+            deletions = list(old_value_set - new_value_set)
+            if additions and deletions:
                 # Minimize the number of values that needs to be transferred
-                if len(addList + removeList) >= len(newValue):
+                if len(additions + deletions) >= len(newValue):
                     modifications.append((ldap.MOD_REPLACE, key, newValue))
                 else:
-                    modifications.append((ldap.MOD_DELETE, key, removeList))
-                    modifications.append((ldap.MOD_ADD, key, addList))
-            elif addList:
-                modifications.append((ldap.MOD_ADD, key, addList))
-            elif removeList:
-                modifications.append((ldap.MOD_DELETE, key, removeList))
+                    modifications.append((ldap.MOD_DELETE, key, deletions))
+                    modifications.append((ldap.MOD_ADD, key, additions))
+            elif additions:
+                modifications.append((ldap.MOD_ADD, key, additions))
+            elif deletions:
+                modifications.append((ldap.MOD_DELETE, key, deletions))
 
     return modifications
 
@@ -47,21 +46,29 @@ class LDAP(object):
         app.extensions['ldap'] = self
         app.teardown_appcontext(self.teardown)
 
-    def connect(self):
+    @staticmethod
+    def connect():
         uri = current_app.config['LDAP_URI']
         conn = ldap.initialize(uri)
-        if (uri.startswith('ldaps:')):
-            conn.set_option(ldap.OPT_X_TLS_REQUIRE_CERT,ldap.OPT_X_TLS_DEMAND)
-            # OPT_X_TLS_CACERTFILE does not work on OS X for some reason but validation seem to work
+        if uri.startswith('ldaps:'):
+            conn.set_option(ldap.OPT_X_TLS_REQUIRE_CERT, ldap.OPT_X_TLS_DEMAND)
+            # OPT_X_TLS_CACERTFILE does not work on OS X for some reason
+            # but validation seem to work
             try:
                 conn.set_option(ldap.OPT_X_TLS_CACERTFILE, certifi.where())
             except ValueError:
                 pass
-            conn.set_option(ldap.OPT_X_TLS_NEWCTX,0)
-        conn.simple_bind_s(current_app.config['LDAP_BINDDN'], current_app.config['LDAP_SECRET'])
+            conn.set_option(ldap.OPT_X_TLS_NEWCTX, 0)
+        conn.simple_bind_s(
+            current_app.config['LDAP_BINDDN'],
+            current_app.config['LDAP_SECRET']
+        )
         return conn
 
-    def teardown(self, exception):
+    @staticmethod
+    def teardown(exception):
+        if exception:
+            pass
         ctx = _app_ctx_stack.top
         if hasattr(ctx, 'flask_ldap'):
             ctx.flask_ldap.unbind_s()
@@ -85,46 +92,99 @@ class Attribute(object):
 
 class BaseQuery(object):
 
+    WRAPPER_OR = "(|{filter})"
+    
     def __init__(self, model):
         self.model = model
         self._filter = None
         self._base = ldap.SCOPE_SUBTREE
+        self._attributes = list(self.model.get_ldap_attrs())
+        self._base_dn = self.model.base_dn
 
     def _search(self):
-        object_class_filter = ''.join([f'(objectclass={cls})' for cls in self.model.object_classes])
+        object_class_filter = "".join(
+            [
+                "(objectClass={obj_class})".format(obj_class=obj_class)
+                for obj_class in self.model.object_classes
+            ]
+        )
         if self._filter:
-            full_filter = f'(&(&{object_class_filter}){self._filter})'
+            full_filter = "(&(&{object_class_filter}){filter})".format(
+                object_class_filter=object_class_filter, filter=self._filter
+            )
         else:
-            full_filter = f'(&{object_class_filter})'
+            full_filter = "(&{object_class_filter})".format(
+                object_class_filter=object_class_filter
+            )
         try:
             return current_app.extensions['ldap'].connection.search_ext_s(
-                self.model.base_dn,
-                self._base,
-                full_filter,
-                attrlist=list(self.model._ldap_attrs)
+                self._base_dn, self._base, full_filter,
+                attrlist=self._attributes
             )
         except ldap.NO_SUCH_OBJECT:
             return []
 
-    def filter(self, filter):
-        self._filter = filter
+    def filter(self, legacy_filter=None, **kwargs):
+        if legacy_filter:
+            self._filter = legacy_filter
+            return self
+        self._filter = str() if not self._filter else self._filter
+        for key, value in kwargs.items():
+            expression = key.split("__")
+            if len(expression) > 1:
+                attr, compare = expression
+            else:
+                attr, compare = expression[0], None
+            if attr in self.model.get_attr_defs().keys():
+                attr_ldap = self.model.get_attr_defs()[attr].ldap_name
+                if compare == "notequal":
+                    template = "(!(%s=%s))"
+                elif compare == "startswith":
+                    template = "(%s=%s*)"
+                elif compare == "endswith":
+                    template = "(%s=*%s)"
+                elif compare == "contains":
+                    template = "(%s=*%s*)"
+                else:
+                    template = "(%s=%s)"
+                self._filter += filter_format(template, [attr_ldap, value])
         return self
-
+                    
+    def wrapper(self, wrapper):
+        self._filter = wrapper.format(filter=self._filter)
+        return self
+        
     def base(self, base):
         self._base = base
         return self
+    
+    def base_dn(self, base_dn):
+        self._base_dn = base_dn
+        return self
 
+    def get(self, dn):
+        self._base = ldap.SCOPE_BASE
+        self._base_dn = dn
+        return self.first()
+    
     def all(self):
         return [self.model.from_search(*result) for result in self._search()]
-
+    
     def first(self):
         res = self._search()
         return self.model.from_search(*res[0]) if res else None
+    
+    def fields(self, *args):
+        self._attributes = [
+            self.model.get_attr_defs()[arg].ldap_name for arg in args
+            if arg in self.model.get_attr_defs().keys()
+        ]
+        return self
 
 
 class ModelBase(type):
     base_dn = None
-    entry_rdn = 'cn'
+    entry_rdn = None
     object_classes = ['top']
 
     def __init__(cls, name, bases, ns):
@@ -134,9 +194,9 @@ class ModelBase(type):
 
         for base in bases:
             if hasattr(base, '_attr_defs'):
-                _attr_defs.update(base._attr_defs)
+                _attr_defs.update(base.get_attr_defs())
             if hasattr(base, '_ldap_attrs'):
-                _ldap_attrs.update(base._ldap_attrs)
+                _ldap_attrs.update(base.get_ldap_attrs())
 
         for key, value in ns.items():
             if isinstance(value, Attribute):
@@ -150,9 +210,17 @@ class ModelBase(type):
         cls._attr_defs = _attr_defs
         cls._ldap_attrs = _ldap_attrs
 
+        super().__init__(name, bases, ns)
+
     @property
     def query(cls):
         return BaseQuery(cls)
+
+    def get_ldap_attrs(cls):
+        return cls._ldap_attrs
+
+    def get_attr_defs(cls):
+        return cls._attr_defs
 
 
 class Entry(object, metaclass=ModelBase):
@@ -168,10 +236,15 @@ class Entry(object, metaclass=ModelBase):
                 value = attr_def.default
             attributes[key] = self.normalize_for_ldap(value)
             if not dn and attr_def.ldap_name == self.entry_rdn:
-                dn = f'{self.entry_rdn}={kwargs.get(key)},{self.base_dn}'
+                dn = "{entry_rdn}={key},{base_dn}".format(
+                    entry_rdn=self.entry_rdn, key=kwargs.get(key),
+                    base_dn=(self.base_dn if self.base_dn else "None")
+                )
 
         object.__setattr__(self, '_attributes', attributes)
-        self._initial_attributes = self.prep_attr_dict_for_ldap(_initial_attributes)
+        self._initial_attributes = self.prep_attr_dict_for_ldap(
+            _initial_attributes
+        )
 
         self.dn = dn
         self.new = new
@@ -191,8 +264,9 @@ class Entry(object, metaclass=ModelBase):
 
     @staticmethod
     def normalize_for_ldap(obj):
-        if obj is None: return []
-        return obj if isinstance(obj, list) else [str(obj)]
+        return [] if not obj else (
+            obj if isinstance(obj, list) else [str(obj)]
+        )
 
     @classmethod
     def prep_attr_dict_for_ldap(cls, d):
@@ -230,13 +304,26 @@ class Entry(object, metaclass=ModelBase):
             object.__setattr__(self, key, value)
 
     def __repr__(self):
-        return str((self.dn, [(k, getattr(self, k)) for k in self._attributes.keys()]))
+        return str((
+            self.dn, [(k, getattr(self, k)) for k in self._attributes.keys()]
+        ))
 
+    def represent(self, exclude_empty=False, exclude_always=None):
+        represented = {key: getattr(self, key) for key in self._attr_defs}
+        if exclude_empty:
+            represented = {
+                key: value for key, value in represented.items() if value
+            }
+        if exclude_always:
+            for key in exclude_always:
+                del represented[key]
+        return represented
+    
     def save(self):
         if self.new:
             add_attributes = self.prep_attr_dict_for_ldap(self._attributes)
             add_list = list({
-                'objectclass': [x.encode() for x in self.object_classes],
+                'objectClass': [x.encode() for x in self.object_classes],
                 **add_attributes
             }.items())
             current_app.extensions['ldap'].connection.add_s(self.dn, add_list)
@@ -244,8 +331,10 @@ class Entry(object, metaclass=ModelBase):
             self.new = False
         else:
             new_attributes = self.prep_attr_dict_for_ldap(self._attributes)
-            mod_list = modify_modlist(self._initial_attributes, new_attributes)
-            current_app.extensions['ldap'].connection.modify_s(self.dn, mod_list)
+            mod_list = get_mod_list(self._initial_attributes, new_attributes)
+            current_app.extensions['ldap'].connection.modify_s(
+                self.dn, mod_list
+            )
             self._initial_attributes = new_attributes
         return True
 
@@ -254,5 +343,5 @@ class Entry(object, metaclass=ModelBase):
             current_app.extensions['ldap'].connection.delete_s(self.dn)
             self.new = True
             return True
-        except:
+        except ldap.LDAPError:
             return False
